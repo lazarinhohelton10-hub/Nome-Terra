@@ -13,7 +13,6 @@ interface SocketData {
 
 function sanitizeName(raw: unknown): string {
   const name = String(raw ?? '').trim();
-  // remove tags HTML/scripts, mantém letras (incluindo acentuadas), números, espaços e alguns símbolos
   const stripped = name.replace(/<[^>]*>/g, '');
   return stripped.slice(0, 16);
 }
@@ -23,7 +22,7 @@ function friendlyError(message: string) {
 }
 
 export function registerHandlers(io: Server, rooms: RoomManager) {
-  const disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>(); // key: `${code}:${sessionId}`
+  const disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   function broadcastRoomState(room: GameRoom) {
     const sockets = io.sockets.adapter.rooms.get(room.code);
@@ -37,16 +36,13 @@ export function registerHandlers(io: Server, rooms: RoomManager) {
 
   function scheduleCountdownThenRound(room: GameRoom) {
     setTimeout(() => {
-      if (room.state !== 'COUNTDOWN') return; // pode ter sido cancelado (sala esvaziou, etc.)
-      room.startRound((event, payload) => io.to(room.code).emit(event, payload));
+      if (room.state !== 'COUNTDOWN') return;
+      room.startRound((event, payload) => {
+        io.to(room.code).emit(event, payload);
+        broadcastRoomState(room);
+      });
       broadcastRoomState(room);
-      maybeAutoFinalizeReview(room);
     }, COUNTDOWN_MS);
-  }
-
-  function maybeAutoFinalizeReview(_room: GameRoom) {
-    // A finalização da revisão é despoletada a cada voto (ver game:vote),
-    // não precisa de polling; mantido como hook explícito para clareza.
   }
 
   function finalizeIfReady(room: GameRoom) {
@@ -72,77 +68,68 @@ export function registerHandlers(io: Server, rooms: RoomManager) {
   }
 
   io.on('connection', (socket: Socket) => {
-    socket.on(
-      'room:create',
-      (payload: { name: string }, ack: (res: unknown) => void) => {
-        const name = sanitizeName(payload?.name);
-        if (!name) return ack(friendlyError('Escolhe um nome antes de criar a sala.'));
+    socket.on('room:create', (payload: { name: string }, ack: (res: unknown) => void) => {
+      const name = sanitizeName(payload?.name);
+      if (!name) return ack(friendlyError('Escolhe um nome antes de criar a sala.'));
 
-        const sessionId = generateSessionId();
-        const room = rooms.create(sessionId);
-        room.addPlayer(sessionId, socket.id, name);
+      const sessionId = generateSessionId();
+      const room = rooms.create(sessionId);
+      room.addPlayer(sessionId, socket.id, name);
 
-        socket.data = { sessionId, roomCode: room.code } as SocketData;
-        socket.join(room.code);
-        ack({ ok: true, code: room.code, sessionId });
-        broadcastRoomState(room);
+      socket.data = { sessionId, roomCode: room.code } as SocketData;
+      socket.join(room.code);
+      ack({ ok: true, code: room.code, sessionId });
+      broadcastRoomState(room);
+    });
+
+    socket.on('room:join', (payload: { code: string; name: string }, ack: (res: unknown) => void) => {
+      const code = String(payload?.code ?? '').trim().toUpperCase();
+      const name = sanitizeName(payload?.name);
+      const room = rooms.get(code);
+
+      if (!room) return ack(friendlyError('Não foi possível entrar na sala. Verifica o código.'));
+      if (!name) return ack(friendlyError('Escolhe um nome antes de entrar na sala.'));
+      if (room.state !== 'LOBBY') return ack(friendlyError('A partida já começou.'));
+      if (room.connectedCount >= room.settings.maxPlayers) {
+        return ack(friendlyError('Esta sala atingiu o limite de jogadores.'));
       }
-    );
+      const nameTaken = [...room.players.values()].some(
+        (p) => p.connected && p.name.toLowerCase() === name.toLowerCase()
+      );
+      if (nameTaken) return ack(friendlyError('O teu nome já está a ser utilizado nesta sala.'));
 
-    socket.on(
-      'room:join',
-      (payload: { code: string; name: string }, ack: (res: unknown) => void) => {
-        const code = String(payload?.code ?? '').trim().toUpperCase();
-        const name = sanitizeName(payload?.name);
-        const room = rooms.get(code);
+      const sessionId = generateSessionId();
+      room.addPlayer(sessionId, socket.id, name);
+      socket.data = { sessionId, roomCode: room.code } as SocketData;
+      socket.join(room.code);
 
-        if (!room) return ack(friendlyError('Não foi possível entrar na sala. Verifica o código.'));
-        if (!name) return ack(friendlyError('Escolhe um nome antes de entrar na sala.'));
-        if (room.state !== 'LOBBY') return ack(friendlyError('A partida já começou.'));
-        if (room.connectedCount >= room.settings.maxPlayers) {
-          return ack(friendlyError('Esta sala atingiu o limite de jogadores.'));
-        }
-        const nameTaken = [...room.players.values()].some(
-          (p) => p.connected && p.name.toLowerCase() === name.toLowerCase()
-        );
-        if (nameTaken) return ack(friendlyError('O teu nome já está a ser utilizado nesta sala.'));
+      ack({ ok: true, code: room.code, sessionId });
+      io.to(room.code).emit('room:player_joined', { name });
+      broadcastRoomState(room);
+    });
 
-        const sessionId = generateSessionId();
-        room.addPlayer(sessionId, socket.id, name);
-        socket.data = { sessionId, roomCode: room.code } as SocketData;
-        socket.join(room.code);
+    socket.on('room:rejoin', (payload: { code: string; sessionId: string }, ack: (res: unknown) => void) => {
+      const code = String(payload?.code ?? '').trim().toUpperCase();
+      const room = rooms.get(code);
+      if (!room) return ack(friendlyError('A sala já não existe.'));
+      const existing = room.players.get(payload?.sessionId);
+      if (!existing) return ack(friendlyError('Não foi possível reconectar a esta sessão.'));
 
-        ack({ ok: true, code: room.code, sessionId });
-        io.to(room.code).emit('room:player_joined', { name });
-        broadcastRoomState(room);
+      const timerKey = `${code}:${existing.sessionId}`;
+      const pendingTimer = disconnectTimers.get(timerKey);
+      if (pendingTimer) {
+        clearTimeout(pendingTimer);
+        disconnectTimers.delete(timerKey);
       }
-    );
 
-    socket.on(
-      'room:rejoin',
-      (payload: { code: string; sessionId: string }, ack: (res: unknown) => void) => {
-        const code = String(payload?.code ?? '').trim().toUpperCase();
-        const room = rooms.get(code);
-        if (!room) return ack(friendlyError('A sala já não existe.'));
-        const existing = room.players.get(payload?.sessionId);
-        if (!existing) return ack(friendlyError('Não foi possível reconectar a esta sessão.'));
+      room.addPlayer(existing.sessionId, socket.id, existing.name);
+      socket.data = { sessionId: existing.sessionId, roomCode: room.code } as SocketData;
+      socket.join(room.code);
 
-        const timerKey = `${code}:${existing.sessionId}`;
-        const pendingTimer = disconnectTimers.get(timerKey);
-        if (pendingTimer) {
-          clearTimeout(pendingTimer);
-          disconnectTimers.delete(timerKey);
-        }
-
-        room.addPlayer(existing.sessionId, socket.id, existing.name);
-        socket.data = { sessionId: existing.sessionId, roomCode: room.code } as SocketData;
-        socket.join(room.code);
-
-        ack({ ok: true, code: room.code, sessionId: existing.sessionId });
-        io.to(room.code).emit('room:player_reconnected', { name: existing.name });
-        broadcastRoomState(room);
-      }
-    );
+      ack({ ok: true, code: room.code, sessionId: existing.sessionId });
+      io.to(room.code).emit('room:player_reconnected', { name: existing.name });
+      broadcastRoomState(room);
+    });
 
     socket.on('room:update_settings', (partial: Partial<RoomSettings>) => {
       const data = socket.data as SocketData | undefined;
@@ -174,7 +161,7 @@ export function registerHandlers(io: Server, rooms: RoomManager) {
       const data = socket.data as SocketData | undefined;
       const room = data && rooms.get(data.roomCode);
       if (!room || room.hostSessionId !== data?.sessionId) return;
-      if (room.connectedCount < 2) return; // regra: mínimo 2 jogadores
+      if (room.connectedCount < 2) return;
       room.startGame();
       broadcastRoomState(room);
       scheduleCountdownThenRound(room);
@@ -185,8 +172,6 @@ export function registerHandlers(io: Server, rooms: RoomManager) {
       const room = data && rooms.get(data.roomCode);
       if (!room || !data) return;
       room.submitAnswer(data.sessionId, payload.category, payload.value ?? '');
-      // Não faz broadcast completo a cada tecla premida (evita tempestade de eventos);
-      // as respostas só se tornam visíveis a todos na fase de revisão.
     });
 
     socket.on('game:stop', () => {
@@ -201,33 +186,25 @@ export function registerHandlers(io: Server, rooms: RoomManager) {
       }
     });
 
-    socket.on(
-      'game:vote',
-      (payload: { category: string; targetSessionId: string; vote: VoteValue }) => {
-        const data = socket.data as SocketData | undefined;
-        const room = data && rooms.get(data.roomCode);
-        if (!room || !data) return;
-        room.castVote(data.sessionId, payload.category, payload.targetSessionId, payload.vote);
-        broadcastRoomState(room);
-        finalizeIfReady(room);
-      }
-    );
+    socket.on('game:vote', (payload: { category: string; targetSessionId: string; vote: VoteValue }) => {
+      const data = socket.data as SocketData | undefined;
+      const room = data && rooms.get(data.roomCode);
+      if (!room || !data) return;
+      room.castVote(data.sessionId, payload.category, payload.targetSessionId, payload.vote);
+      broadcastRoomState(room);
+      finalizeIfReady(room);
+    });
 
-    socket.on(
-      'game:host_decide',
-      (payload: { category: string; targetSessionId: string; decision: VoteValue }) => {
-        const data = socket.data as SocketData | undefined;
-        const room = data && rooms.get(data.roomCode);
-        if (!room || room.hostSessionId !== data?.sessionId) return;
-        room.hostDecide(payload.category, payload.targetSessionId, payload.decision);
-        broadcastRoomState(room);
-        finalizeIfReady(room);
-      }
-    );
+    socket.on('game:host_decide', (payload: { category: string; targetSessionId: string; decision: VoteValue }) => {
+      const data = socket.data as SocketData | undefined;
+      const room = data && rooms.get(data.roomCode);
+      if (!room || room.hostSessionId !== data?.sessionId) return;
+      room.hostDecide(payload.category, payload.targetSessionId, payload.decision);
+      broadcastRoomState(room);
+      finalizeIfReady(room);
+    });
 
     socket.on('game:force_finalize', () => {
-      // permite ao anfitrião avançar mesmo que nem todos tenham votado
-      // (ex.: alguém desligou-se durante a revisão)
       const data = socket.data as SocketData | undefined;
       const room = data && rooms.get(data.roomCode);
       if (!room || room.hostSessionId !== data?.sessionId || room.state !== 'REVIEW') return;
@@ -277,7 +254,6 @@ export function registerHandlers(io: Server, rooms: RoomManager) {
 
       const timerKey = `${room.code}:${data.sessionId}`;
       const timer = setTimeout(() => {
-        // se ainda não voltou dentro do período de tolerância, remove definitivamente
         const stillThere = room.players.get(data.sessionId);
         if (stillThere && !stillThere.connected) {
           room.removePlayer(data.sessionId);
