@@ -30,20 +30,41 @@ nome-terra/
 
 ## Arquitetura e autoridade do servidor
 
-O servidor é a única fonte de verdade. O cliente nunca decide a letra, o
-temporizador, o estado da ronda ou a pontuação — só envia nomes, respostas e
-votos. Isto está implementado assim:
+O servidor é a única fonte de verdade. O cliente nunca decide o número de
+rondas, quem controla cada ronda, o temporizador, o estado da ronda ou a
+pontuação — só envia nomes, a letra escolhida (quando é a sua vez), respostas
+e votos. Isto está implementado assim:
 
 - `server/src/GameRoom.ts` — a máquina de estados de uma sala:
-  `LOBBY → COUNTDOWN → PLAYING → REVIEW → SCORING → (COUNTDOWN | FINISHED)`.
-  Sabe quem são os jogadores, que letra está em jogo, que letras já foram
-  usadas, as respostas da ronda atual, o histórico de rondas e a pontuação.
+  `LOBBY → COUNTDOWN → CHOOSING_LETTER → PLAYING → REVIEW → SCORING → (COUNTDOWN | FINISHED)`.
+  Sabe quem são os jogadores, a ordem de turnos, quem controla a ronda atual,
+  que letra está em jogo, que letras já foram usadas, as respostas da ronda
+  atual, o histórico de rondas e a pontuação.
+
+### Regra de rondas por turnos
+
+- **Número de rondas = número de jogadores ligados quando a partida começa.**
+  Cada jogador escolhe a letra exatamente uma vez, numa ordem aleatória
+  gerada nesse momento (não a ordem de entrada no lobby).
+- Enquanto não é a tua vez, vês um ecrã de espera ("X está a escolher a
+  letra..."); quando é a tua vez, escolhes uma letra ainda não usada e
+  confirmas.
+- **Só quem escolheu a letra dessa ronda pode carregar STOP.** Os outros
+  jogadores só respondem.
+- Se o responsável de uma ronda estiver desligado quando chega a sua vez, ou
+  se desligar a meio da ronda e não voltar dentro do período de tolerância
+  (`RECONNECT_GRACE_MS`), o controlo passa automaticamente para outro
+  jogador ligado, e todos são avisados ("X assumiu o controlo desta ronda").
+- Se o tempo esgotar sozinho (sem ninguém carregar STOP), o servidor encerra
+  a ronda de qualquer forma — isto nunca depende do responsável estar
+  presente.
+
 - `server/src/RoomManager.ts` — guarda todas as salas ativas em memória e
   limpa salas vazias e inativas periodicamente.
 - `server/src/scoring.ts` — motor de pontuação modular e testado
   isoladamente (`classic` 10/5/0, `differentiated` 20/10/0, `no_duplicates`
   10/0/0).
-- `server/src/letters.ts` — escolha aleatória de letra sem repetição.
+- `server/src/letters.ts` — baralhar a ordem dos jogadores (Fisher-Yates).
 - `server/src/handlers.ts` — liga tudo isto aos eventos Socket.IO.
 
 ### Eventos Socket.IO
@@ -62,7 +83,8 @@ nome de si próprio, e ações de anfitrião são verificadas contra
 | `room:kick` | `{ targetSessionId }` | só o anfitrião |
 | `game:start` | — | só o anfitrião, precisa de ≥2 jogadores ligados |
 | `game:submit_answer` | `{ category, value }` | com *debounce* no cliente (200ms) |
-| `game:stop` | — | qualquer jogador ligado |
+| `game:choose_letter` | `{ letter }` | só o jogador responsável pela ronda (`controllerSessionId`), só em `CHOOSING_LETTER` |
+| `game:stop` | — | só o jogador responsável pela ronda atual |
 | `game:vote` | `{ category, targetSessionId, vote }` | nunca na própria resposta |
 | `game:host_decide` | `{ category, targetSessionId, decision }` | só o anfitrião, só em empates |
 | `game:force_finalize` | — | só o anfitrião, avança a validação mesmo incompleta |
@@ -78,6 +100,7 @@ Servidor → Cliente:
 | `room:player_disconnected` / `room:player_reconnected` | perdas de ligação temporárias |
 | `room:kicked` | enviado só ao jogador expulso |
 | `game:round_finished` | motivo: `stop` \| `timeout` \| `validated` |
+| `game:controller_reassigned` | o responsável da ronda mudou (ausência/desistência) |
 | `game:finished` | fim da partida |
 
 ### Sincronização do temporizador
@@ -143,26 +166,30 @@ resultados sincronizados em tempo real.
 
 ```bash
 cd server
-npm test              # testes unitários (Vitest): pontuação e máquina de estados
+npm test              # testes unitários (Vitest): pontuação, máquina de estados, ordem de turnos e substituição
 ```
 
-Há também dois scripts que ligam **dois clientes Socket.IO reais** ao
+Há também quatro scripts que ligam **dois clientes Socket.IO reais** ao
 servidor (não simulados) para confirmar o fluxo ponta-a-ponta, incluindo pela
 rede:
 
 ```bash
 cd server
-npm run dev                    # numa janela, deixa o servidor a correr
-npm run test:e2e               # noutra janela: cria sala, joga uma ronda completa, valida a pontuação
-npm run test:e2e:reconnect     # simula um jogador a perder a ligação a meio da ronda e a voltar
+npm run dev                        # numa janela, deixa o servidor a correr
+npm run test:e2e                   # noutra janela: joga uma partida completa (2 jogadores = 2 rondas, cada um escolhe a sua letra)
+npm run test:e2e:reconnect         # simula um jogador a perder a ligação a meio da ronda e a voltar
+npm run test:e2e:timeout           # confirma que a ronda avança sozinha quando o tempo esgota sem ninguém carregar STOP
+npm run test:e2e:substitution      # confirma que o controlo passa para outro jogador se o responsável se desligar
 ```
 
-Ambos os scripts foram corridos durante o desenvolvimento contra o servidor
-compilado e passaram, confirmando: criação/entrada em sala, letra aleatória
-escolhida pelo servidor, temporizador, STOP, votação (com a regra de não
-poder votar em si próprio), cálculo de pontos (5+5 para uma resposta válida
-repetida), avanço de ronda, resultado final, e recuperação de uma resposta já
-escrita depois de uma reconexão a meio da ronda.
+Todos foram corridos durante o desenvolvimento contra o servidor compilado e
+passaram, confirmando: criação/entrada em sala, ordem de turnos aleatória,
+escolha manual da letra pelo jogador responsável, STOP restrito a esse
+jogador (o outro é ignorado), temporizador sincronizado pelo servidor,
+votação (com a regra de não poder votar em si próprio), cálculo de pontos
+(5+5 para uma resposta válida repetida), avanço de ronda, resultado final, e
+recuperação de uma resposta já escrita depois de uma reconexão a meio da
+ronda, e transferência de controlo quando o responsável se desliga.
 
 ## Variáveis de ambiente
 

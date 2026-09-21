@@ -1,4 +1,4 @@
-export type GameState = 'LOBBY' | 'COUNTDOWN' | 'PLAYING' | 'REVIEW' | 'SCORING' | 'FINISHED';
+export type GameState = 'LOBBY' | 'COUNTDOWN' | 'CHOOSING_LETTER' | 'PLAYING' | 'REVIEW' | 'SCORING' | 'FINISHED';
 export type ScoringMode = 'classic' | 'differentiated' | 'no_duplicates';
 export type VoteValue = 'accept' | 'reject';
 
@@ -54,6 +54,10 @@ export interface PublicRoomState {
   roundEndsAt: number | null;
   roundDurationMs: number | null;
   myAnswers: AnswerSet | null;
+  playerOrder: { sessionId: string; name: string }[];
+  controllerSessionId: string | null;
+  controllerName: string | null;
+  availableLetters: string[];
   review: {
     categories: CategoryResultPublic[];
     votesNeededFrom: string[];

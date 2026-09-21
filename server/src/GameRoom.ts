@@ -11,7 +11,7 @@ import type {
   RoundRecord,
   VoteValue,
 } from './types.js';
-import { DEFAULT_LETTERS, pickRandomLetter } from './letters.js';
+import { DEFAULT_LETTERS, shuffle } from './letters.js';
 import { normalizeAnswer, scoreCategory } from './scoring.js';
 
 const DEFAULT_CATEGORIES = ['Nome', 'Terra', 'Animal', 'Comida', 'Objeto'];
@@ -47,6 +47,8 @@ export class GameRoom {
   roundTimer: ReturnType<typeof setTimeout> | null = null;
   roundEndsAt: number | null = null;
   lastActivityAt = Date.now();
+  playerOrder: string[] = []; // sessionIds, ordem definida (aleatória) no início da partida
+  controllerSessionId: string | null = null; // quem escolhe a letra / controla o STOP nesta ronda
   private stoppedBySessionId: string | null = null;
   private pendingResults: CategoryResult[] | null = null;
 
@@ -135,32 +137,92 @@ export class GameRoom {
       p.validAnswers = 0;
       p.uniqueAnswers = 0;
     }
+    // Regra fundamental: número de rondas = número de jogadores presentes no
+    // início da partida, e cada um escolhe a letra exatamente uma vez, numa
+    // ordem aleatória definida agora e fixa até ao fim da partida. Se a sala
+    // tiver menos letras ativadas do que jogadores, limitamos às letras
+    // disponíveis para nunca pedir uma letra que já não existe.
+    const connected = [...this.players.values()].filter((p) => p.connected).map((p) => p.sessionId);
+    this.playerOrder = shuffle(connected);
+    this.settings.totalRounds = Math.min(this.playerOrder.length, this.settings.enabledLetters.length);
     this.state = 'COUNTDOWN';
   }
 
-  /** Chamado depois da animação de countdown no cliente (ou por timeout do servidor). */
-  startRound(emit: Emit) {
+  /** Encontra quem controla a ronda: o jogador agendado, ou um substituto
+   * (o próximo jogador ligado na ordem) se ele estiver desligado — ver
+   * secções 28/29/31 do briefing sobre substituição do responsável. */
+  private resolveController(scheduledSessionId: string): { sessionId: string; substituted: boolean } {
+    const scheduled = this.players.get(scheduledSessionId);
+    if (scheduled?.connected) return { sessionId: scheduledSessionId, substituted: false };
+
+    const idx = this.playerOrder.indexOf(scheduledSessionId);
+    const startIdx = idx === -1 ? 0 : idx;
+    for (let offset = 1; offset <= this.playerOrder.length; offset++) {
+      const candidateId = this.playerOrder[(startIdx + offset) % this.playerOrder.length];
+      const candidate = this.players.get(candidateId);
+      if (candidate?.connected) return { sessionId: candidateId, substituted: true };
+    }
+    const anyConnected = [...this.players.values()].find((p) => p.connected);
+    return { sessionId: anyConnected?.sessionId ?? scheduledSessionId, substituted: true };
+  }
+
+  /** Chamado depois da animação de countdown, para cada nova ronda. Em vez de
+   * escolher a letra automaticamente, entra na fase em que o jogador
+   * responsável desta ronda a escolhe manualmente. */
+  enterChoosingLetter(emit: Emit): { controllerName: string; substituted: boolean } | null {
     this.currentRound += 1;
-    const letter = pickRandomLetter(this.settings.enabledLetters, this.usedLetters);
-    if (!letter) {
-      // esgotaram-se as letras disponíveis: termina a partida de forma controlada
+    if (this.currentRound > this.playerOrder.length) {
       this.finishGame();
       emit('game:finished', this.toPublicState(null));
-      return;
+      return null;
     }
-    this.currentLetter = letter;
-    this.usedLetters.push(letter);
+    const scheduledSessionId = this.playerOrder[this.currentRound - 1];
+    const { sessionId: controllerId, substituted } = this.resolveController(scheduledSessionId);
+    this.controllerSessionId = controllerId;
+    this.currentLetter = null;
     this.currentAnswers = new Map();
     this.stoppedBySessionId = null;
     this.pendingResults = null;
+    this.state = 'CHOOSING_LETTER';
+    this.clearRoundTimer();
+    return { controllerName: this.players.get(controllerId)?.name ?? '???', substituted };
+  }
+
+  /** O jogador responsável confirma a letra desta ronda (ver secções 3-5). */
+  chooseLetter(sessionId: string, letter: string, emit: Emit): boolean {
+    if (this.state !== 'CHOOSING_LETTER') return false;
+    if (sessionId !== this.controllerSessionId) return false;
+    const upper = letter.trim().toUpperCase();
+    if (!this.settings.enabledLetters.includes(upper)) return false;
+    if (this.usedLetters.includes(upper)) return false;
+
+    this.currentLetter = upper;
+    this.usedLetters.push(upper);
     this.state = 'PLAYING';
     this.roundEndsAt = Date.now() + this.settings.roundSeconds * 1000;
 
     this.clearRoundTimer();
     this.roundTimer = setTimeout(() => {
       this.forceStopRound('timeout');
-      emit('game:round_finished', { reason: 'timeout', state: this.toPublicState(null) });
+      emit('game:round_finished', { reason: 'timeout' });
     }, this.settings.roundSeconds * 1000);
+    return true;
+  }
+
+  /** Se o responsável atual estiver desligado (esgotou o período de
+   * tolerância ou saiu em definitivo), transfere o controlo para um
+   * substituto. Devolve o nome do novo responsável se algo mudou. */
+  reassignControllerIfNeeded(): { changed: boolean; newControllerName?: string } {
+    if (this.state !== 'CHOOSING_LETTER' && this.state !== 'PLAYING') return { changed: false };
+    const current = this.controllerSessionId;
+    if (!current) return { changed: false };
+    const currentPlayer = this.players.get(current);
+    if (currentPlayer?.connected) return { changed: false };
+
+    const { sessionId: substituteId } = this.resolveController(current);
+    if (substituteId === current) return { changed: false }; // ninguém mais ligado
+    this.controllerSessionId = substituteId;
+    return { changed: true, newControllerName: this.players.get(substituteId)?.name };
   }
 
   submitAnswer(sessionId: string, category: string, value: string) {
@@ -172,9 +234,10 @@ export class GameRoom {
     this.touch();
   }
 
-  /** Qualquer jogador ligado pode carregar STOP (ver regras da sala). */
+  /** Apenas o jogador que escolheu a letra desta ronda pode carregar STOP. */
   stopRound(sessionId: string): boolean {
     if (this.state !== 'PLAYING') return false;
+    if (sessionId !== this.controllerSessionId) return false;
     this.stoppedBySessionId = sessionId;
     this.forceStopRound('stop');
     return true;
@@ -328,7 +391,7 @@ export class GameRoom {
   }
 
   hasNextRound(): boolean {
-    return this.currentRound < this.settings.totalRounds && this.usedLetters.length < this.settings.enabledLetters.length;
+    return this.currentRound < this.playerOrder.length && this.currentRound < this.settings.totalRounds;
   }
 
   advanceToNextRoundOrFinish(emit: Emit) {
@@ -345,6 +408,7 @@ export class GameRoom {
     this.state = 'FINISHED';
     this.currentLetter = null;
     this.roundEndsAt = null;
+    this.controllerSessionId = null;
   }
 
   resetForRematch() {
@@ -356,6 +420,8 @@ export class GameRoom {
     this.currentAnswers = new Map();
     this.pendingResults = null;
     this.roundEndsAt = null;
+    this.playerOrder = [];
+    this.controllerSessionId = null;
     for (const p of this.players.values()) {
       p.totalScore = 0;
       p.roundsWon = 0;
@@ -416,6 +482,15 @@ export class GameRoom {
       roundEndsAt: this.roundEndsAt,
       roundDurationMs: this.settings.roundSeconds * 1000,
       myAnswers: forSessionId ? this.currentAnswers.get(forSessionId) ?? {} : null,
+      playerOrder: this.playerOrder.map((sessionId) => ({
+        sessionId,
+        name: this.players.get(sessionId)?.name ?? '???',
+      })),
+      controllerSessionId: this.controllerSessionId,
+      controllerName: this.controllerSessionId
+        ? this.players.get(this.controllerSessionId)?.name ?? null
+        : null,
+      availableLetters: this.settings.enabledLetters.filter((l) => !this.usedLetters.includes(l)),
       review: this.state === 'REVIEW' || this.state === 'SCORING' ? this.reviewPublic() : null,
       scoring:
         this.state === 'SCORING' && this.history.length > 0

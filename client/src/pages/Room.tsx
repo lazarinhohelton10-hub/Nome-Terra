@@ -4,7 +4,6 @@ import { clearSession, emitWithAck, loadSession, saveSession, socket } from '../
 import type { CategoryEntryPublic, PublicRoomState, VoteValue } from '../types';
 
 const ALL_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
-const ROUND_OPTIONS = [5, 10, 15, 20];
 const TIME_OPTIONS = [30, 45, 60, 90, 120];
 
 export default function Room() {
@@ -71,6 +70,9 @@ export default function Room() {
       if (payload.reason === 'stop') showBanner(`${payload.by} carregou em STOP!`);
       else if (payload.reason === 'timeout') showBanner('Tempo esgotado!');
     }
+    function onControllerReassigned(payload: { name: string }) {
+      showBanner(`${payload.name} assumiu o controlo desta ronda.`);
+    }
     function onDisconnect() {
       setConnectionLost(true);
     }
@@ -88,6 +90,7 @@ export default function Room() {
     socket.on('room:player_reconnected', onPlayerReconnected);
     socket.on('room:kicked', onKicked);
     socket.on('game:round_finished', onRoundFinished);
+    socket.on('game:controller_reassigned', onControllerReassigned);
     socket.on('disconnect', onDisconnect);
     socket.on('connect', onConnect);
     socket.on('connect_error', onConnectError);
@@ -100,6 +103,7 @@ export default function Room() {
       socket.off('room:player_reconnected', onPlayerReconnected);
       socket.off('room:kicked', onKicked);
       socket.off('game:round_finished', onRoundFinished);
+      socket.off('game:controller_reassigned', onControllerReassigned);
       socket.off('disconnect', onDisconnect);
       socket.off('connect', onConnect);
       socket.off('connect_error', onConnectError);
@@ -136,7 +140,8 @@ export default function Room() {
         {state.state === 'LOBBY' && (
           <Lobby state={state} isHost={isHost} mySessionId={sessionId} onLeave={() => leaveRoom(navigate)} />
         )}
-        {state.state === 'COUNTDOWN' && <Countdown />}
+        {state.state === 'COUNTDOWN' && <Countdown state={state} />}
+        {state.state === 'CHOOSING_LETTER' && <ChoosingLetterScreen state={state} mySessionId={sessionId} />}
         {state.state === 'PLAYING' && <PlayingScreen state={state} mySessionId={sessionId} />}
         {state.state === 'REVIEW' && <ReviewScreen state={state} mySessionId={sessionId} isHost={isHost} />}
         {state.state === 'SCORING' && (
@@ -312,7 +317,7 @@ function Lobby({
 function SettingsSummary({ settings }: { settings: PublicRoomState['settings'] }) {
   return (
     <ul className="mt-4 flex flex-col gap-1 text-sm text-paper/50">
-      <li>{settings.totalRounds} rondas</li>
+      <li>Uma ronda por jogador — cada um escolhe a sua letra à vez</li>
       <li>{settings.roundSeconds}s por ronda</li>
       <li>Categorias: {settings.categories.join(', ')}</li>
     </ul>
@@ -360,13 +365,10 @@ function SettingsPanel({
       <p className="text-sm font-semibold text-paper">Configuração da partida</p>
 
       <Field label="Número de rondas">
-        <div className="flex flex-wrap gap-2">
-          {ROUND_OPTIONS.map((n) => (
-            <Pill key={n} active={settings.totalRounds === n} onClick={() => update({ totalRounds: n })}>
-              {n}
-            </Pill>
-          ))}
-        </div>
+        <p className="text-sm text-paper/70">
+          Igual ao número de jogadores — atualmente {connectedCount}. Cada jogador escolhe a letra da sua ronda,
+          por turnos, uma vez só durante a partida.
+        </p>
       </Field>
 
       <Field label="Tempo por ronda">
@@ -476,18 +478,109 @@ function Pill({ active, onClick, children }: { active: boolean; onClick: () => v
 // COUNTDOWN
 // ---------------------------------------------------------------------------
 
-function Countdown() {
+function Countdown({ state }: { state: PublicRoomState }) {
   const [n, setN] = useState(3);
   useEffect(() => {
     const id = setInterval(() => setN((v) => Math.max(0, v - 1)), 900);
     return () => clearInterval(id);
   }, []);
   return (
-    <div className="flex flex-col items-center justify-center py-24">
+    <div className="flex flex-col items-center justify-center py-16">
       <p className="font-display text-9xl font-bold text-gold animate-letter-pop" key={n}>
         {n > 0 ? n : 'Já!'}
       </p>
       <p className="mt-4 text-paper/60">Prepara-te...</p>
+      {state.playerOrder.length > 0 && (
+        <div className="mt-10 rounded-xl border border-paper/10 bg-ink-light px-6 py-4">
+          <p className="mb-2 text-center text-xs uppercase tracking-widest text-paper/50">Ordem das rondas</p>
+          <ol className="flex flex-col gap-1">
+            {state.playerOrder.map((p, i) => (
+              <li
+                key={p.sessionId}
+                className={`text-sm ${i === state.currentRound ? 'font-semibold text-gold' : 'text-paper/60'}`}
+              >
+                {i + 1}. {p.name}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CHOOSING_LETTER (escolha da letra pelo jogador responsável)
+// ---------------------------------------------------------------------------
+
+function ChoosingLetterScreen({ state, mySessionId }: { state: PublicRoomState; mySessionId: string }) {
+  const isController = state.controllerSessionId === mySessionId;
+  const [pending, setPending] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPending(null);
+  }, [state.controllerSessionId]);
+
+  if (!isController) {
+    return (
+      <div className="flex flex-col items-center py-24">
+        <p className="text-paper/70">{state.controllerName} está a escolher a letra...</p>
+        <p className="mt-6 animate-pulse text-5xl">⏳</p>
+      </div>
+    );
+  }
+
+  function confirm() {
+    if (!pending) return;
+    socket.emit('game:choose_letter', { letter: pending });
+  }
+
+  return (
+    <div className="flex flex-col items-center py-8">
+      <p className="text-sm uppercase tracking-widest text-gold">É a tua vez</p>
+      <h2 className="mt-2 font-display text-3xl font-semibold text-paper">Escolhe uma letra</h2>
+
+      {!pending ? (
+        <div className="mt-8 grid grid-cols-6 gap-2 sm:grid-cols-7">
+          {ALL_LETTERS.map((l) => {
+            const disabled = !state.availableLetters.includes(l);
+            return (
+              <button
+                key={l}
+                disabled={disabled}
+                onClick={() => setPending(l)}
+                className={`h-11 w-11 rounded-lg text-lg font-semibold transition ${
+                  disabled
+                    ? 'cursor-not-allowed bg-ink text-paper/15'
+                    : 'bg-ink-light text-paper hover:bg-gold hover:text-ink'
+                }`}
+              >
+                {l}
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="mt-10 flex flex-col items-center gap-4 animate-slide-up">
+          <p className="text-paper/80">
+            Escolheste a letra <span className="font-display text-4xl font-bold text-gold">{pending}</span>
+          </p>
+          <div className="flex gap-3">
+            <button
+              onClick={() => setPending(null)}
+              className="rounded-lg border border-paper/20 px-4 py-2 text-paper/70 hover:border-paper/40"
+            >
+              Escolher outra
+            </button>
+            <button
+              onClick={confirm}
+              className="rounded-lg bg-gold px-6 py-2 font-semibold text-ink hover:bg-gold-bright"
+            >
+              Confirmar
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -524,7 +617,7 @@ function PlayingScreen({ state, mySessionId }: { state: PublicRoomState; mySessi
     }, 200);
   }
 
-  const stopperName = state.players.find((p) => p.sessionId !== mySessionId)?.name;
+  const isController = state.controllerSessionId === mySessionId;
 
   return (
     <div>
@@ -552,17 +645,21 @@ function PlayingScreen({ state, mySessionId }: { state: PublicRoomState; mySessi
         ))}
       </div>
 
-      <div className="mt-8 flex justify-center">
-        <button
-          onClick={() => socket.emit('game:stop')}
-          className="rounded-full bg-coral px-10 py-4 text-xl font-bold text-ink shadow-lg transition hover:brightness-110"
-        >
-          🛑 STOP
-        </button>
+      <div className="mt-8 flex flex-col items-center gap-3">
+        {isController ? (
+          <button
+            onClick={() => socket.emit('game:stop')}
+            className="rounded-full bg-coral px-10 py-4 text-xl font-bold text-ink shadow-lg transition hover:brightness-110"
+          >
+            🛑 STOP
+          </button>
+        ) : (
+          <p className="text-sm text-paper/50">
+            <span className="font-semibold text-paper/70">{state.controllerName}</span> controla esta ronda e pode
+            carregar STOP.
+          </p>
+        )}
       </div>
-      <p className="mt-3 text-center text-xs text-paper/40">
-        Qualquer jogador pode carregar STOP{stopperName ? '' : ''} para terminar a ronda mais cedo.
-      </p>
     </div>
   );
 }

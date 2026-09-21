@@ -12,3 +12,15 @@ export function pickRandomLetter(
   const idx = Math.floor(Math.random() * pool.length);
   return pool[idx];
 }
+
+/** Fisher-Yates: baralha uma lista sem alterar o array original. Usado para
+ * gerar a ordem dos jogadores no início da partida (ver secção 2 do
+ * briefing: ordem aleatória, não a ordem de entrada no lobby). */
+export function shuffle<T>(items: T[]): T[] {
+  const arr = [...items];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}

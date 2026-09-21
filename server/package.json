@@ -9,7 +9,9 @@
     "start": "node dist/index.js",
     "test": "vitest run",
     "test:e2e": "tsx scripts/e2e-smoke.ts",
-    "test:e2e:reconnect": "tsx scripts/e2e-reconnect.ts"
+    "test:e2e:reconnect": "tsx scripts/e2e-reconnect.ts",
+    "test:e2e:timeout": "tsx scripts/e2e-timeout.ts",
+    "test:e2e:substitution": "tsx scripts/e2e-controller-substitution.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

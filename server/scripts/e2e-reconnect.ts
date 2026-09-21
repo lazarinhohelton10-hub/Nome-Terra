@@ -19,9 +19,17 @@ async function main() {
   });
   console.log('✔ Sala criada e João entrou:', created.code);
 
-  a.emit('room:update_settings', { categories: ['Animal'], roundSeconds: 60, totalRounds: 1 });
+  a.emit('room:update_settings', { categories: ['Animal'], roundSeconds: 60 });
   await new Promise((r) => setTimeout(r, 200));
   a.emit('game:start');
+
+  const choosing = await new Promise<any>((resolve) => {
+    a.on('room:state', (s: any) => {
+      if (s.state === 'CHOOSING_LETTER' && s.controllerSessionId) resolve(s);
+    });
+  });
+  const controllerSocket = choosing.controllerSessionId === created.sessionId ? a : b;
+  controllerSocket.emit('game:choose_letter', { letter: 'M' });
 
   await new Promise<void>((resolve) => {
     a.on('room:state', (s: any) => {

@@ -5,6 +5,7 @@
 export type GameState =
   | 'LOBBY'
   | 'COUNTDOWN'
+  | 'CHOOSING_LETTER'
   | 'PLAYING'
   | 'REVIEW'
   | 'SCORING'
@@ -94,6 +95,10 @@ export interface PublicRoomState {
   roundEndsAt: number | null; // epoch ms, para o cliente calcular o countdown de forma sincronizada
   roundDurationMs: number | null;
   myAnswers: AnswerSet | null;
+  playerOrder: { sessionId: string; name: string }[];
+  controllerSessionId: string | null;
+  controllerName: string | null;
+  availableLetters: string[];
   review: {
     categories: CategoryResultPublic[];
     votesNeededFrom: string[]; // sessionIds que ainda faltam votar (para o próprio ecrã)
